@@ -95,6 +95,7 @@ STATE = {
     "raw": None,
     "unit": "m³",
     "updated_at": None,
+    "last_success_at": None,
     "confidence": None,
     "interval": INTERVAL_SECONDS,
     "camera": dict(CAMERA_SETTINGS),
@@ -654,6 +655,7 @@ def measure_once() -> None:
             "raw": raw,
             "unit": "m³",
             "updated_at": timestamp,
+            "last_success_at": timestamp,
             "confidence": confidence,
             "samples": counts,
             "interval": get_interval(),
@@ -823,6 +825,9 @@ def main() -> None:
             with STATE_LOCK:
                 STATE.update(previous_state)
                 STATE["unit"] = "m³"
+                STATE["last_success_at"] = previous_state.get(
+                    "last_success_at", previous_state.get("updated_at")
+                )
         except (OSError, json.JSONDecodeError):
             pass
     load_camera_settings()
@@ -847,10 +852,12 @@ def main() -> None:
     threading.Thread(target=server.serve_forever, name="http-api", daemon=True).start()
     try:
         while not STOP_EVENT.is_set():
+            cycle_started = time.monotonic()
             measure_once()
             if STOP_EVENT.is_set():
                 break
-            MEASURE_WAKEUP_EVENT.wait(timeout=get_interval())
+            elapsed = time.monotonic() - cycle_started
+            MEASURE_WAKEUP_EVENT.wait(timeout=max(0, get_interval() - elapsed))
             MEASURE_WAKEUP_EVENT.clear()
     finally:
         server.shutdown()

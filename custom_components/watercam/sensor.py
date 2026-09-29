@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -37,6 +38,7 @@ async def async_setup_entry(
             WatercamZaehlerstandSensor(coordinator, entry),
             WatercamSicherheitSensor(coordinator, entry),
             WatercamRawDisplaySensor(coordinator, entry),
+            WatercamLastSuccessfulReadSensor(coordinator, entry),
             WatercamVerbrauchSensor(
                 coordinator, entry, "verbrauch_tag", "day", "mdi:calendar-today"
             ),
@@ -116,7 +118,7 @@ class WatercamZaehlerstandSensor(WatercamBaseEntity, SensorEntity):
         return {
             "raw_display": self.coordinator.data.get("raw"),
             "confidence_margin": self.coordinator.data.get("confidence"),
-            "last_read": self.coordinator.data.get("updated_at"),
+            "last_read": self.coordinator.data.get("last_success_at"),
             "source": f"WaterCAM ({self.coordinator.host})",
         }
 
@@ -164,6 +166,32 @@ class WatercamRawDisplaySensor(WatercamBaseEntity, SensorEntity):
         if not self.coordinator.data:
             return None
         return self.coordinator.data.get("raw")
+
+
+class WatercamLastSuccessfulReadSensor(WatercamBaseEntity, SensorEntity):
+    """Timestamp of the last successfully accepted meter reading."""
+
+    _attr_translation_key = "letzte_auslesung"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:clock-check-outline"
+
+    def __init__(
+        self,
+        coordinator: WatercamDataUpdateCoordinator,
+        entry: ConfigEntry,
+    ) -> None:
+        """Initialize the timestamp sensor."""
+        super().__init__(coordinator, entry, "letzte_auslesung")
+
+    @property
+    def native_value(self) -> datetime | None:
+        """Return the last successful reading as a timezone-aware datetime."""
+        if not self.coordinator.data:
+            return None
+        value = self.coordinator.data.get("last_success_at")
+        if not value and self.coordinator.data.get("status") == "ok":
+            value = self.coordinator.data.get("updated_at")
+        return dt_util.parse_datetime(value) if value else None
 
 
 class WatercamVerbrauchSensor(WatercamBaseEntity, RestoreEntity, SensorEntity):

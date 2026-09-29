@@ -28,6 +28,9 @@
       "rohanzeige": {
         "name": "Rohanzeige"
       },
+      "letzte_auslesung": {
+        "name": "Letzte erfolgreiche Auslesung"
+      },
       "verbrauch_tag": {
         "name": "Verbrauch heute"
       },

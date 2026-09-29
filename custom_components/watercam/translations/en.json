@@ -28,6 +28,9 @@
       "rohanzeige": {
         "name": "Raw Display"
       },
+      "letzte_auslesung": {
+        "name": "Last successful reading"
+      },
       "verbrauch_tag": {
         "name": "Consumption Today"
       },

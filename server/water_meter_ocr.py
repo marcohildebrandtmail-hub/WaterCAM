@@ -517,6 +517,33 @@ def validate_value(value: float, previous: float | None) -> None:
         raise ValueError(f"Unplausibler Sprung: {previous:.3f} -> {value:.3f}")
 
 
+def select_stable_reading(
+    readings: list[tuple[str, float, np.ndarray]],
+) -> tuple[str, float, np.ndarray, dict[str, int]]:
+    """Select a clearly dominant reading from one camera burst."""
+    counts: dict[str, int] = {}
+    for raw, _, _ in readings:
+        counts[raw] = counts.get(raw, 0) + 1
+
+    ranked = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+    raw, top_count = ranked[0]
+    second_count = ranked[1][1] if len(ranked) > 1 else 0
+    valid_count = len(readings)
+    share = top_count / valid_count
+
+    if top_count < 3:
+        raise RuntimeError(f"Keine stabile Mehrheitslesung: {counts}")
+    if second_count and (share < 0.65 or top_count - second_count < 2):
+        raise RuntimeError(
+            f"Mehrheitslesung nicht eindeutig ({top_count}/{valid_count}, "
+            f"Abstand {top_count - second_count}): {counts}"
+        )
+
+    matching = [item for item in readings if item[0] == raw]
+    selected_raw, confidence, best_frame = max(matching, key=lambda item: item[1])
+    return selected_raw, confidence, best_frame, counts
+
+
 def ha_set_state(entity_id: str, state: str, attributes: dict) -> None:
     if not HA_URL or not HA_TOKEN:
         return
@@ -629,14 +656,7 @@ def measure_once() -> None:
         if not readings:
             raise RuntimeError("Keine der Aufnahmen konnte sicher gelesen werden")
 
-        counts = {}
-        for raw, _, _ in readings:
-            counts[raw] = counts.get(raw, 0) + 1
-        raw = max(counts, key=counts.get)
-        matching = [item for item in readings if item[0] == raw]
-        if len(matching) < 3:
-            raise RuntimeError(f"Keine stabile Mehrheitslesung: {counts}")
-        raw, confidence, best_frame = max(matching, key=lambda item: item[1])
+        raw, confidence, best_frame, counts = select_stable_reading(readings)
         value = float(raw)
         validate_value(value, previous)
 

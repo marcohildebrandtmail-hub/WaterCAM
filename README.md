@@ -36,6 +36,7 @@ Die Integration bindet den Wasserzähler als eigenständiges **Home Assistant Ge
 | **Sensor** | `sensor.watercam_sicherheit` | Erkennungs-Sicherheit | Sicherheitsabstand der Segmenterkennung |
 | **Sensor** | `sensor.watercam_rohanzeige` | Rohanzeige | Raw-String aus der OCR (z.B. `000363.068`) |
 | **Sensor** | `sensor.watercam_letzte_erfolgreiche_auslesung` | Letzte erfolgreiche Auslesung | Zeitpunkt des letzten erfolgreich akzeptierten Zählerstands |
+| **Sensor** | `sensor.watercam_letzter_ausleseversuch` | Letzter Ausleseversuch | Zeitpunkt jedes OCR-Versuchs, auch wenn die Erkennung verworfen wurde |
 | **Binary Sensor** | `binary_sensor.watercam_ocr_status` | OCR Status | Konnektivität und Erkennungsstatus (`on` = ok) |
 | **Camera** | `camera.watercam_live_snapshot` | Live-Kamerabild (Annotiert) | Vollbild mit Erkennungs-Boxen (`/snapshot.jpg`) |
 | **Camera** | `camera.watercam_lcd_display` | LCD-Display | Reiner LCD-Ausschnitt (`/display.jpg`) |

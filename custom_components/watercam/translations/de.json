@@ -31,6 +31,9 @@
       "letzte_auslesung": {
         "name": "Letzte erfolgreiche Auslesung"
       },
+      "letzter_versuch": {
+        "name": "Letzter Ausleseversuch"
+      },
       "verbrauch_tag": {
         "name": "Verbrauch heute"
       },

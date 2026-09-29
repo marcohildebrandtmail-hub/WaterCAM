@@ -39,6 +39,7 @@ async def async_setup_entry(
             WatercamSicherheitSensor(coordinator, entry),
             WatercamRawDisplaySensor(coordinator, entry),
             WatercamLastSuccessfulReadSensor(coordinator, entry),
+            WatercamLastAttemptSensor(coordinator, entry),
             WatercamVerbrauchSensor(
                 coordinator, entry, "verbrauch_tag", "day", "mdi:calendar-today"
             ),
@@ -191,6 +192,30 @@ class WatercamLastSuccessfulReadSensor(WatercamBaseEntity, SensorEntity):
         value = self.coordinator.data.get("last_success_at")
         if not value and self.coordinator.data.get("status") == "ok":
             value = self.coordinator.data.get("updated_at")
+        return dt_util.parse_datetime(value) if value else None
+
+
+class WatercamLastAttemptSensor(WatercamBaseEntity, SensorEntity):
+    """Timestamp of the last measurement attempt, successful or not."""
+
+    _attr_translation_key = "letzter_versuch"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:clock-outline"
+
+    def __init__(
+        self,
+        coordinator: WatercamDataUpdateCoordinator,
+        entry: ConfigEntry,
+    ) -> None:
+        """Initialize the timestamp sensor."""
+        super().__init__(coordinator, entry, "letzter_versuch")
+
+    @property
+    def native_value(self) -> datetime | None:
+        """Return the last attempted reading as a timezone-aware datetime."""
+        if not self.coordinator.data:
+            return None
+        value = self.coordinator.data.get("updated_at")
         return dt_util.parse_datetime(value) if value else None
 
 

@@ -73,6 +73,10 @@ SEGMENT_DIGITS = {
     frozenset("abcdfg"): "9",
 }
 MIN_PATTERN_CONFIDENCE = 2.0
+MIN_CONSENSUS_CONFIDENCE = 1.5
+METER_MAX_FLOW_M3_PER_HOUR = 4.0
+FLOW_RATE_SAFETY_FACTOR = 1.5
+MIN_ALLOWED_DELTA_M3 = 0.005
 
 STATE_LOCK = threading.Lock()
 CAMERA_LOCK = threading.Lock()
@@ -443,10 +447,14 @@ def classify_digit(digit_scores: dict[str, float]) -> tuple[str, float]:
         inactive = [
             digit_scores[name] for name in "abcdefg" if name not in pattern
         ]
-        # A correct pattern separates its weakest active segment from its
-        # strongest inactive one. The all-active digit 8 uses the calibrated
-        # off-segment noise floor as its comparison point.
-        fit = min(active) - (max(inactive) if inactive else 5.0)
+        # Small LCD digits have uneven segment contrast. The mean separation
+        # carries most of the decision while the edge separation still
+        # penalizes missing required segments and strong unexpected segments.
+        inactive_mean = sum(inactive) / len(inactive) if inactive else 5.0
+        inactive_max = max(inactive) if inactive else 5.0
+        mean_fit = sum(active) / len(active) - inactive_mean
+        edge_fit = min(active) - inactive_max
+        fit = 0.9 * mean_fit + 0.1 * edge_fit
         ranked.append((fit, digit))
 
     ranked.sort(key=lambda item: item[0], reverse=True)
@@ -456,6 +464,7 @@ def classify_digit(digit_scores: dict[str, float]) -> tuple[str, float]:
 
 def decode_scores(
     scores: list[dict[str, float]],
+    minimum_confidence: float = MIN_PATTERN_CONFIDENCE,
 ) -> tuple[str, float]:
     """Decode all positions and reject weak pattern matches."""
     digits = []
@@ -466,7 +475,7 @@ def decode_scores(
         confidences.append(confidence)
 
     confidence = round(min(confidences), 2)
-    if confidence < MIN_PATTERN_CONFIDENCE:
+    if confidence < minimum_confidence:
         raise ValueError(
             f"Sieben-Segment-Muster nicht eindeutig (Sicherheit {confidence:.2f})"
         )
@@ -511,24 +520,49 @@ def annotate(frame: np.ndarray, raw: str, confidence: float) -> np.ndarray:
     return output
 
 
-def load_previous_value() -> float | None:
+def load_previous_reading() -> tuple[float | None, datetime | None]:
     path = DATA_DIR / "status.json"
     if not path.exists():
-        return None
+        return None, None
     try:
-        value = json.loads(path.read_text(encoding="utf-8")).get("value")
-        return None if value is None else float(value)
+        state = json.loads(path.read_text(encoding="utf-8"))
+        value = state.get("value")
+        timestamp = state.get("last_success_at") or state.get("updated_at")
+        parsed_timestamp = datetime.fromisoformat(timestamp) if timestamp else None
+        return (None if value is None else float(value), parsed_timestamp)
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return None
+        return None, None
 
 
-def validate_value(value: float, previous: float | None) -> None:
+def validate_value(
+    value: float,
+    previous: float | None,
+    previous_timestamp: datetime | None,
+    current_timestamp: datetime,
+) -> None:
     if previous is None:
         return
     if value + 0.001 < previous:
         raise ValueError(f"Zähler würde rückwärts springen: {previous:.3f} -> {value:.3f}")
-    if value - previous > 5.0:
-        raise ValueError(f"Unplausibler Sprung: {previous:.3f} -> {value:.3f}")
+    if previous_timestamp is None:
+        max_delta = 0.1
+    else:
+        elapsed_seconds = max(
+            1.0, (current_timestamp - previous_timestamp).total_seconds()
+        )
+        max_delta = max(
+            MIN_ALLOWED_DELTA_M3,
+            METER_MAX_FLOW_M3_PER_HOUR
+            * elapsed_seconds
+            / 3600.0
+            * FLOW_RATE_SAFETY_FACTOR,
+        )
+    delta = value - previous
+    if delta > max_delta:
+        raise ValueError(
+            f"Durchfluss physikalisch unplausibel: {previous:.3f} -> {value:.3f} "
+            f"({delta * 1000:.1f} L, erlaubt {max_delta * 1000:.1f} L)"
+        )
 
 
 def select_stable_reading(
@@ -657,7 +691,8 @@ def publish_error(message: str, timestamp: str) -> None:
 
 def measure_once() -> None:
     timestamp = utc_now()
-    previous = load_previous_value()
+    current_timestamp = datetime.fromisoformat(timestamp)
+    previous, previous_timestamp = load_previous_reading()
     alignment = None
     try:
         frames, alignment = capture_frames()
@@ -675,7 +710,9 @@ def measure_once() -> None:
             raise RuntimeError("Keine der Aufnahmen konnte sicher gelesen werden")
 
         raw, confidence, best_frame, counts = select_stable_reading(readings)
-        consensus_raw, consensus_confidence = decode_scores(median_scores(score_sets))
+        consensus_raw, consensus_confidence = decode_scores(
+            median_scores(score_sets), MIN_CONSENSUS_CONFIDENCE
+        )
         if consensus_raw != raw:
             raise RuntimeError(
                 f"Frame-Mehrheit und Segment-Median widersprechen sich: "
@@ -683,7 +720,7 @@ def measure_once() -> None:
             )
         confidence = consensus_confidence
         value = float(raw)
-        validate_value(value, previous)
+        validate_value(value, previous, previous_timestamp, current_timestamp)
 
         annotated = annotate(best_frame, raw, confidence)
         display = best_frame[275:470, 410:890]

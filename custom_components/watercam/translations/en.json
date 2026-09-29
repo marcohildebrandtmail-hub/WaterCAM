@@ -3,11 +3,10 @@
     "step": {
       "user": {
         "title": "Connect WaterCAM",
-        "description": "Enter the connection details for the WaterCAM service (LXC 121).",
+        "description": "Enter the connection details for the WaterCAM service (LXC 121). The water meter readings are pushed in real time after every measurement.",
         "data": {
           "host": "IP Address / Host",
-          "port": "Port",
-          "scan_interval": "Update Interval (Seconds)"
+          "port": "Port"
         }
       }
     },

@@ -3,11 +3,10 @@
     "step": {
       "user": {
         "title": "WaterCAM verbinden",
-        "description": "Gib die Verbindungsdaten für den WaterCAM-Dienst (LXC 121) ein.",
+        "description": "Gib die Verbindungsdaten für den WaterCAM-Dienst (LXC 121) ein. Der Zählerstand wird nach jeder Messung per Live-Push in Echtzeit an Home Assistant gesendet.",
         "data": {
           "host": "IP-Adresse / Host",
-          "port": "Port",
-          "scan_interval": "Abfrage-Intervall (Sekunden)"
+          "port": "Port"
         }
       }
     },

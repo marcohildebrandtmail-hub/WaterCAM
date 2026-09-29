@@ -1,4 +1,4 @@
-"""DataUpdateCoordinator for WaterCAM."""
+"""DataUpdateCoordinator for WaterCAM with Live-Push support."""
 
 from __future__ import annotations
 
@@ -11,19 +11,18 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import CONF_HOST, CONF_PORT, CONF_SCAN_INTERVAL, DEFAULT_HOST, DEFAULT_PORT, DEFAULT_SCAN_INTERVAL, DOMAIN
+from .const import CONF_HOST, CONF_PORT, DEFAULT_HOST, DEFAULT_PORT, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class WatercamDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Class to manage fetching WaterCAM data from container API."""
+    """Class to manage fetching & receiving WaterCAM data."""
 
     def __init__(self, hass: HomeAssistant, entry_data: dict[str, Any]) -> None:
         """Initialize."""
         self.host = entry_data.get(CONF_HOST, DEFAULT_HOST)
         self.port = entry_data.get(CONF_PORT, DEFAULT_PORT)
-        scan_interval = entry_data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
         self.base_url = f"http://{self.host}:{self.port}"
         self.session = async_get_clientsession(hass)
 
@@ -31,7 +30,8 @@ class WatercamDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=timedelta(seconds=scan_interval),
+            # Passive safety heartbeat once every hour; active updates arrive instantly via Live-Push
+            update_interval=timedelta(hours=1),
         )
 
     async def _async_update_data(self) -> dict[str, Any]:
@@ -48,6 +48,22 @@ class WatercamDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception as err:
             raise UpdateFailed(f"Unerwarteter Fehler beim Abruf von {url}: {err}") from err
 
+    async def async_register_webhook(self, webhook_url: str) -> bool:
+        """Register the Home Assistant webhook URL on the WaterCAM container."""
+        url = f"{self.base_url}/api/webhook_register"
+        try:
+            payload = {"webhook_url": webhook_url}
+            async with self.session.post(
+                url, json=payload, timeout=aiohttp.ClientTimeout(total=10)
+            ) as response:
+                if response.status == 200:
+                    _LOGGER.info("WaterCAM Live-Push Webhook erfolgreich registriert: %s", webhook_url)
+                    return True
+                _LOGGER.warning("WaterCAM Webhook-Registrierung antwortete mit HTTP %s", response.status)
+        except Exception as err:
+            _LOGGER.warning("Konnte Webhook nicht bei WaterCAM registrieren (%s): %s", url, err)
+        return False
+
     async def async_trigger_measure(self) -> bool:
         """Trigger an on-demand measurement via POST /api/measure."""
         url = f"{self.base_url}/api/measure"
@@ -57,3 +73,8 @@ class WatercamDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception as err:
             _LOGGER.warning("Fehler beim Triggern der manuellen Messung: %s", err)
             return False
+
+    def async_receive_push(self, data: dict[str, Any]) -> None:
+        """Process real-time data pushed from the WaterCAM container."""
+        _LOGGER.debug("WaterCAM Live-Push empfangen: %s", data)
+        self.async_set_updated_data(data)

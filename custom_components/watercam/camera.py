@@ -22,8 +22,10 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up WaterCAM cameras."""
-    coordinator: WatercamDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    entry_data = hass.data[DOMAIN][entry.entry_id]
+    coordinator: WatercamDataUpdateCoordinator = (
+        entry_data["coordinator"] if isinstance(entry_data, dict) else entry_data
+    )
 
     async_add_entities(
         [

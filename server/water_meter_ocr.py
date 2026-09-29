@@ -276,7 +276,44 @@ def publish_success(value: float, raw: str, confidence: float, timestamp: str) -
     )
 
 
+WEBHOOK_FILE = DATA_DIR / "webhook_url.txt"
+
+
+def get_webhook_url() -> str:
+    if WEBHOOK_FILE.exists():
+        try:
+            return WEBHOOK_FILE.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    return os.getenv("WEBHOOK_URL", "")
+
+
+def set_webhook_url(url: str) -> None:
+    try:
+        WEBHOOK_FILE.write_text(url.strip(), encoding="utf-8")
+    except Exception as exc:
+        print(f"Fehler beim Speichern der Webhook-URL: {exc}", flush=True)
+
+
+def push_webhook(payload: dict) -> None:
+    webhook_url = get_webhook_url()
+    if not webhook_url:
+        return
+    try:
+        req = Request(
+            webhook_url,
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urlopen(req, timeout=5) as response:
+            pass
+    except Exception as exc:
+        print(f"Webhook-Push fehlgeschlagen ({webhook_url}): {exc}", flush=True)
+
+
 def publish_error(message: str, timestamp: str) -> None:
+    push_webhook({"status": "error", "updated_at": timestamp, "error": message})
     try:
         ha_set_state(
             "binary_sensor.wasserzaehler_ocr_status",
@@ -340,6 +377,7 @@ def measure_once() -> None:
         with STATE_LOCK:
             STATE.update(status)
         publish_success(value, raw, confidence, timestamp)
+        push_webhook(status)
         print(f"{timestamp} gelesen: {raw} m³ (Sicherheit {confidence:.2f})", flush=True)
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
@@ -395,6 +433,28 @@ class ApiHandler(BaseHTTPRequestHandler):
                 json.dumps({"status": "accepted", "message": "Messung gestartet"}).encode("utf-8"),
                 "application/json",
                 202,
+            )
+            return
+        if self.path in ("/api/webhook_register", "/api/webhook"):
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
+            url = body.get("webhook_url", "")
+            if url:
+                set_webhook_url(url)
+                print(f"Neuer Home-Assistant-Webhook registriert: {url}", flush=True)
+                with STATE_LOCK:
+                    current_state = dict(STATE)
+                threading.Thread(target=push_webhook, args=(current_state,), daemon=True).start()
+                self.send_bytes(
+                    json.dumps({"status": "ok", "webhook_url": url}).encode("utf-8"),
+                    "application/json",
+                    200,
+                )
+                return
+            self.send_bytes(
+                json.dumps({"error": "missing webhook_url"}).encode("utf-8"),
+                "application/json",
+                400,
             )
             return
         self.send_bytes(b"Not found\n", "text/plain", 404)

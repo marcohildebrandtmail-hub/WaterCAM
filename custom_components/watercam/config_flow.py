@@ -1,4 +1,4 @@
-"""Config flow for WaterCAM integration."""
+"""Config flow for WaterCAM integration with Live-Push."""
 
 from __future__ import annotations
 
@@ -9,17 +9,16 @@ import aiohttp
 import voluptuous as vol
 
 from homeassistant import config_entries
+from homeassistant.components import webhook
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
     CONF_HOST,
     CONF_PORT,
-    CONF_SCAN_INTERVAL,
     DEFAULT_HOST,
     DEFAULT_NAME,
     DEFAULT_PORT,
-    DEFAULT_SCAN_INTERVAL,
     DOMAIN,
 )
 
@@ -45,15 +44,20 @@ class WatercamConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             await self.async_set_unique_id(unique_id)
             self._abort_if_unique_id_configured()
 
-            # Test connection
+            # Test connection to CT 121
             session = async_get_clientsession(self.hass)
             url = f"http://{host}:{port}/api/status"
             try:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
                     if response.status == 200:
+                        webhook_id = webhook.async_generate_id()
+                        entry_data = {
+                            **user_input,
+                            "webhook_id": webhook_id,
+                        }
                         return self.async_create_entry(
                             title=DEFAULT_NAME,
-                            data=user_input,
+                            data=entry_data,
                         )
                     errors["base"] = "cannot_connect"
             except Exception:
@@ -63,7 +67,6 @@ class WatercamConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             {
                 vol.Required(CONF_HOST, default=DEFAULT_HOST): str,
                 vol.Required(CONF_PORT, default=DEFAULT_PORT): int,
-                vol.Required(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL): int,
             }
         )
 

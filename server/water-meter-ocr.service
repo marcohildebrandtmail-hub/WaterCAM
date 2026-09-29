@@ -1,0 +1,23 @@
+[Unit]
+Description=QALCOSONIC W1 water meter OCR
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/water-meter-ocr.conf
+ExecStart=/usr/bin/python3 /opt/water-meter-ocr/water_meter_ocr.py
+Restart=on-failure
+RestartSec=10
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/water-meter-ocr
+DevicePolicy=closed
+DeviceAllow=/dev/video0 rw
+
+[Install]
+WantedBy=multi-user.target

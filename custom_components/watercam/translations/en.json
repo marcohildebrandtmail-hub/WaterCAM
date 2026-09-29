@@ -1,0 +1,52 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect WaterCAM",
+        "description": "Enter the connection details for the WaterCAM service (LXC 121).",
+        "data": {
+          "host": "IP Address / Host",
+          "port": "Port",
+          "scan_interval": "Update Interval (Seconds)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the WaterCAM endpoint. Please check host and port."
+    },
+    "abort": {
+      "already_configured": "This WaterCAM device is already configured."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "zaehlerstand": {
+        "name": "Water Meter Reading"
+      },
+      "sicherheit": {
+        "name": "Confidence Margin"
+      },
+      "rohanzeige": {
+        "name": "Raw Display"
+      }
+    },
+    "binary_sensor": {
+      "status": {
+        "name": "OCR Status"
+      }
+    },
+    "camera": {
+      "live_snapshot": {
+        "name": "Live Snapshot (Annotated)"
+      },
+      "lcd_display": {
+        "name": "LCD Display"
+      }
+    },
+    "button": {
+      "measure_now": {
+        "name": "Read Now"
+      }
+    }
+  }
+}

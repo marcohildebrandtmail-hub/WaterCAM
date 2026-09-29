@@ -1,0 +1,11 @@
+{
+  "domain": "watercam",
+  "name": "WaterCAM",
+  "codeowners": ["@marcohildebrandtmail-hub"],
+  "config_flow": true,
+  "documentation": "https://github.com/marcohildebrandtmail-hub/WaterCAM",
+  "issue_tracker": "https://github.com/marcohildebrandtmail-hub/WaterCAM/issues",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "version": "1.0.0"
+}

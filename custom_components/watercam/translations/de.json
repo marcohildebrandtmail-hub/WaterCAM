@@ -1,0 +1,52 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "WaterCAM verbinden",
+        "description": "Gib die Verbindungsdaten für den WaterCAM-Dienst (LXC 121) ein.",
+        "data": {
+          "host": "IP-Adresse / Host",
+          "port": "Port",
+          "scan_interval": "Abfrage-Intervall (Sekunden)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Verbindung zum WaterCAM-Endpunkt fehlgeschlagen. Bitte IP und Port prüfen."
+    },
+    "abort": {
+      "already_configured": "Dieses WaterCAM-Gerät ist bereits eingerichtet."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "zaehlerstand": {
+        "name": "Zählerstand"
+      },
+      "sicherheit": {
+        "name": "Erkennungs-Sicherheit"
+      },
+      "rohanzeige": {
+        "name": "Rohanzeige"
+      }
+    },
+    "binary_sensor": {
+      "status": {
+        "name": "OCR Status"
+      }
+    },
+    "camera": {
+      "live_snapshot": {
+        "name": "Live-Kamerabild (Annotiert)"
+      },
+      "lcd_display": {
+        "name": "LCD-Display"
+      }
+    },
+    "button": {
+      "measure_now": {
+        "name": "Jetzt auslesen"
+      }
+    }
+  }
+}

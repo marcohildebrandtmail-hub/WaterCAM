@@ -72,6 +72,7 @@ SEGMENT_DIGITS = {
     frozenset("abcdefg"): "8",
     frozenset("abcdfg"): "9",
 }
+MIN_PATTERN_CONFIDENCE = 2.0
 
 STATE_LOCK = threading.Lock()
 CAMERA_LOCK = threading.Lock()
@@ -434,49 +435,62 @@ def segment_scores(frame: np.ndarray) -> list[dict[str, float]]:
     return result
 
 
-def choose_threshold(scores: list[dict[str, float]]) -> float:
-    """Find the threshold that best explains all positions as seven-segment digits."""
-    best = None
-    for half_step in range(20, 50):  # 10.0 to 24.5
-        threshold = half_step / 2.0
-        total_distance = 0
-        for digit_scores in scores:
-            active = frozenset(name for name, score in digit_scores.items() if score >= threshold)
-            total_distance += min(
-                len(active.symmetric_difference(pattern)) for pattern in SEGMENT_DIGITS
-            )
-        margin = min(abs(value - threshold) for digit in scores for value in digit.values())
-        candidate = (total_distance, abs(threshold - 15.0), -margin, threshold)
-        if best is None or candidate < best:
-            best = candidate
-    return best[-1] if best else 15.0
+def classify_digit(digit_scores: dict[str, float]) -> tuple[str, float]:
+    """Classify one digit by comparing complete seven-segment patterns."""
+    ranked = []
+    for pattern, digit in SEGMENT_DIGITS.items():
+        active = [digit_scores[name] for name in pattern]
+        inactive = [
+            digit_scores[name] for name in "abcdefg" if name not in pattern
+        ]
+        # A correct pattern separates its weakest active segment from its
+        # strongest inactive one. The all-active digit 8 uses the calibrated
+        # off-segment noise floor as its comparison point.
+        fit = min(active) - (max(inactive) if inactive else 5.0)
+        ranked.append((fit, digit))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    confidence = ranked[0][0] - ranked[1][0]
+    return ranked[0][1], confidence
+
+
+def decode_scores(
+    scores: list[dict[str, float]],
+) -> tuple[str, float]:
+    """Decode all positions and reject weak pattern matches."""
+    digits = []
+    confidences = []
+    for digit_scores in scores:
+        digit, confidence = classify_digit(digit_scores)
+        digits.append(digit)
+        confidences.append(confidence)
+
+    confidence = round(min(confidences), 2)
+    if confidence < MIN_PATTERN_CONFIDENCE:
+        raise ValueError(
+            f"Sieben-Segment-Muster nicht eindeutig (Sicherheit {confidence:.2f})"
+        )
+    raw = "".join(digits[:6]) + "." + "".join(digits[6:])
+    return raw, confidence
 
 
 def decode_frame(frame: np.ndarray) -> tuple[str, float, list[dict[str, float]]]:
     scores = segment_scores(frame)
-    threshold = choose_threshold(scores)
-    digits = []
-    margins = []
-    for index, digit_scores in enumerate(scores):
-        active = frozenset(name for name, score in digit_scores.items() if score >= threshold)
-        decoded = SEGMENT_DIGITS.get(active)
-        if decoded is None:
-            nearest = sorted(
-                (len(active.symmetric_difference(pattern)), value)
-                for pattern, value in SEGMENT_DIGITS.items()
-            )
-            best_distance = nearest[0][0]
-            nearest_digits = [value for distance, value in nearest if distance == best_distance]
-            if best_distance != 1 or len(nearest_digits) != 1:
-                raise ValueError(
-                    f"Ungültiges Segmentmuster {sorted(active)} (nächste Ziffern {nearest[:3]})"
-                )
-            decoded = nearest_digits[0]
-        digits.append(decoded)
-        margins.extend(abs(score - threshold) for score in digit_scores.values())
-    raw = "".join(digits[:6]) + "." + "".join(digits[6:])
-    confidence = round(min(margins), 2)
+    raw, confidence = decode_scores(scores)
     return raw, confidence, scores
+
+
+def median_scores(score_sets: list[list[dict[str, float]]]) -> list[dict[str, float]]:
+    """Build an outlier-resistant segment profile for one capture burst."""
+    return [
+        {
+            segment: float(
+                np.median([scores[index][segment] for scores in score_sets])
+            )
+            for segment in "abcdefg"
+        }
+        for index in range(len(DIGIT_BOXES))
+    ]
 
 
 def annotate(frame: np.ndarray, raw: str, confidence: float) -> np.ndarray:
@@ -648,15 +662,26 @@ def measure_once() -> None:
     try:
         frames, alignment = capture_frames()
         readings = []
+        score_sets = []
         for frame in frames:
+            scores = segment_scores(frame)
+            score_sets.append(scores)
             try:
-                readings.append((*decode_frame(frame)[:2], frame))
+                raw, confidence = decode_scores(scores)
+                readings.append((raw, confidence, frame))
             except ValueError:
                 continue
         if not readings:
             raise RuntimeError("Keine der Aufnahmen konnte sicher gelesen werden")
 
         raw, confidence, best_frame, counts = select_stable_reading(readings)
+        consensus_raw, consensus_confidence = decode_scores(median_scores(score_sets))
+        if consensus_raw != raw:
+            raise RuntimeError(
+                f"Frame-Mehrheit und Segment-Median widersprechen sich: "
+                f"{raw} / {consensus_raw} ({counts})"
+            )
+        confidence = consensus_confidence
         value = float(raw)
         validate_value(value, previous)
 

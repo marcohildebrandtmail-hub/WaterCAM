@@ -19,7 +19,8 @@ Die Integration bindet den Wasserzähler als eigenständiges **Home Assistant Ge
   - `camera.watercam_lcd_display`: Scharfer, unveränderter Display-Ausschnitt.
 - 🎯 **Pixelgenaue 7-Segment-Erkennung:**
   - Robuste Segment-Abtastung für 6 Großziffern und 3 Nachkomma-Kleinziffern.
-  - Dynamische Schwellenwertermittlung mit Hamming-Distanz-Absicherung.
+  - Vollständiger Mustervergleich statt einer störanfälligen globalen Pixelschwelle.
+  - Zeitlicher Median und Mehrheitsprüfung über den gesamten Aufnahmestapel.
 - 📐 **Automatische Bildausrichtung:** Kleine Verschiebungen, Drehungen und Abstandsänderungen der Kamera werden anhand fester Gehäusemerkmale korrigiert, bevor die OCR-Boxen ausgewertet werden.
 - 🔄 **On-Demand Messung:** Button `button.watercam_jetzt_auslesen` triggert per Klick sofort eine Neu-Messung via API.
 - 🎛️ **Kamerasteuerung:** Manueller Fokus, Helligkeit, Belichtungszeit und automatische/manuelle Belichtung direkt am Home-Assistant-Gerät. Autofokus bleibt immer ausgeschaltet.

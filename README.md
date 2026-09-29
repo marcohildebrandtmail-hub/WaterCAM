@@ -20,6 +20,7 @@ Die Integration bindet den Wasserzähler als eigenständiges **Home Assistant Ge
 - 🎯 **Pixelgenaue 7-Segment-Erkennung:**
   - Robuste Segment-Abtastung für 6 Großziffern und 3 Nachkomma-Kleinziffern.
   - Dynamische Schwellenwertermittlung mit Hamming-Distanz-Absicherung.
+- 📐 **Automatische Bildausrichtung:** Kleine Verschiebungen, Drehungen und Abstandsänderungen der Kamera werden anhand fester Gehäusemerkmale korrigiert, bevor die OCR-Boxen ausgewertet werden.
 - 🔄 **On-Demand Messung:** Button `button.watercam_jetzt_auslesen` triggert per Klick sofort eine Neu-Messung via API.
 - 🎛️ **Kamerasteuerung:** Manueller Fokus, Helligkeit, Belichtungszeit und automatische/manuelle Belichtung direkt am Home-Assistant-Gerät. Autofokus bleibt immer ausgeschaltet.
 - ⏱️ **Messintervall:** Das OCR-Intervall lässt sich direkt in Home Assistant konfigurieren.
@@ -68,6 +69,8 @@ Die Integration bindet den Wasserzähler als eigenständiges **Home Assistant Ge
 
 Der Server läuft als schlanker Dienst in einem Debian LXC Container (z.B. CT 121 auf Proxmox) mit durchgereichter USB-Kamera (`/dev/video0`).
 
+Das kanonische Rohbild für die automatische Ausrichtung liegt dauerhaft als `alignment_reference.jpg` im konfigurierten `DATA_DIR`. Fehlt es bei einer Neuinstallation, wird es bei der ersten Aufnahme erzeugt.
+
 ### Dateien im Ordner `server/`:
 - `water_meter_ocr.py`: Das Python-Skript zur Kamerasteuerung, 7-Segment-Analyse und HTTP-REST-API.
 - `water-meter-ocr.service`: Systemd Service Unit für Autostart und automatische Wiederherstellung.
@@ -76,6 +79,7 @@ Der Server läuft als schlanker Dienst in einem Debian LXC Container (z.B. CT 12
 - `GET /api/status`: JSON-Status mit Zählerstand, Rohwerten, Zeitstempel und Sicherheit.
 - `POST /api/measure`: Triggert sofortige neue Messung.
 - `GET /api/camera`: Liefert die gespeicherten Kameraeinstellungen.
+- `GET /api/alignment`: Liefert Verschiebung, Drehung, Skalierung und Qualität der letzten automatischen Bildausrichtung.
 - `POST /api/camera`: Speichert Kameraeinstellungen und triggert eine neue Messung.
 - `POST /api/interval`: Speichert das OCR-Messintervall.
 - `GET /snapshot.jpg`: Zuletzt aufgenommenes Vollbild mit Visualisierungs-Boxen.

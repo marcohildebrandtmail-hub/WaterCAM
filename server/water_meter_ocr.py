@@ -80,6 +80,9 @@ MEASURE_WAKEUP_EVENT = threading.Event()
 INTERVAL_FILE = DATA_DIR / "interval.txt"
 CAMERA_SETTINGS_FILE = DATA_DIR / "camera_settings.json"
 CAMERA_SETTINGS_LOCK = threading.Lock()
+ALIGNMENT_REFERENCE_FILE = DATA_DIR / "alignment_reference.jpg"
+ALIGNMENT_REFERENCE_LOCK = threading.Lock()
+ALIGNMENT_REFERENCE = None
 CAMERA_SETTINGS = {
     "focus": 20,
     "brightness": 133,
@@ -95,6 +98,10 @@ STATE = {
     "confidence": None,
     "interval": INTERVAL_SECONDS,
     "camera": dict(CAMERA_SETTINGS),
+    "alignment": {
+        "status": "starting",
+        "reference": ALIGNMENT_REFERENCE_FILE.name,
+    },
     "error": None,
 }
 
@@ -190,6 +197,181 @@ def atomic_write(path: Path, data: bytes) -> None:
     temporary.replace(path)
 
 
+def alignment_mask(shape: tuple[int, ...]) -> np.ndarray:
+    """Mask stable meter features while excluding the changing LCD digits."""
+    height, width = shape[:2]
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.rectangle(
+        mask,
+        (int(width * 0.25), int(height * 0.07)),
+        (int(width * 0.78), int(height * 0.88)),
+        255,
+        -1,
+    )
+    cv2.rectangle(
+        mask,
+        (int(width * 0.32), int(height * 0.37)),
+        (int(width * 0.70), int(height * 0.62)),
+        0,
+        -1,
+    )
+    return mask
+
+
+def alignment_features(frame: np.ndarray):
+    """Extract lighting-tolerant ORB features from the fixed meter housing."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    enhanced = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    orb = cv2.ORB_create(nfeatures=1800, fastThreshold=10)
+    return orb.detectAndCompute(enhanced, alignment_mask(frame.shape))
+
+
+def load_alignment_reference() -> np.ndarray | None:
+    """Load and cache the canonical camera frame used by the OCR boxes."""
+    global ALIGNMENT_REFERENCE
+    with ALIGNMENT_REFERENCE_LOCK:
+        if ALIGNMENT_REFERENCE is None and ALIGNMENT_REFERENCE_FILE.exists():
+            reference = cv2.imread(str(ALIGNMENT_REFERENCE_FILE), cv2.IMREAD_COLOR)
+            if reference is not None:
+                ALIGNMENT_REFERENCE = reference
+        return ALIGNMENT_REFERENCE
+
+
+def save_alignment_reference(frame: np.ndarray) -> np.ndarray:
+    """Persist the first canonical frame for future camera alignment."""
+    global ALIGNMENT_REFERENCE
+    ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 96])
+    if not ok:
+        raise RuntimeError("Ausrichtungsreferenz konnte nicht gespeichert werden")
+    atomic_write(ALIGNMENT_REFERENCE_FILE, encoded.tobytes())
+    with ALIGNMENT_REFERENCE_LOCK:
+        ALIGNMENT_REFERENCE = frame.copy()
+    return ALIGNMENT_REFERENCE
+
+
+def estimate_alignment(
+    current: np.ndarray, reference: np.ndarray
+) -> tuple[np.ndarray, dict]:
+    """Estimate a safe similarity transform from the current frame to reference."""
+    reference_points, reference_descriptors = alignment_features(reference)
+    current_points, current_descriptors = alignment_features(current)
+    if reference_descriptors is None or current_descriptors is None:
+        raise RuntimeError("Zu wenige Merkmale für die Kameraausrichtung")
+
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+    pairs = matcher.knnMatch(current_descriptors, reference_descriptors, k=2)
+    good = [
+        first
+        for pair in pairs
+        if len(pair) == 2
+        for first, second in [pair]
+        if first.distance < 0.72 * second.distance
+    ]
+    if len(good) < 12:
+        raise RuntimeError(f"Nur {len(good)} sichere Ausrichtungsmerkmale gefunden")
+
+    source = np.float32([current_points[item.queryIdx].pt for item in good])
+    target = np.float32([reference_points[item.trainIdx].pt for item in good])
+    matrix, inlier_mask = cv2.estimateAffinePartial2D(
+        source,
+        target,
+        method=cv2.RANSAC,
+        ransacReprojThreshold=2.5,
+        maxIters=3000,
+        confidence=0.995,
+        refineIters=20,
+    )
+    if matrix is None or inlier_mask is None:
+        raise RuntimeError("Kamerabewegung konnte nicht berechnet werden")
+
+    inliers = inlier_mask.ravel().astype(bool)
+    inlier_count = int(inliers.sum())
+    inlier_ratio = inlier_count / len(good)
+    if inlier_count < 10 or inlier_ratio < 0.35:
+        raise RuntimeError(
+            f"Kameraausrichtung unsicher ({inlier_count}/{len(good)} Merkmale)"
+        )
+
+    transformed = cv2.transform(source.reshape(-1, 1, 2), matrix).reshape(-1, 2)
+    mean_error = float(np.linalg.norm(transformed[inliers] - target[inliers], axis=1).mean())
+    scale = float(np.hypot(matrix[0, 0], matrix[1, 0]))
+    rotation = float(np.degrees(np.arctan2(matrix[1, 0], matrix[0, 0])))
+    height, width = current.shape[:2]
+    center = np.float32([[[width / 2, height / 2]]])
+    aligned_center = cv2.transform(center, matrix)[0, 0]
+    shift_x = float(aligned_center[0] - width / 2)
+    shift_y = float(aligned_center[1] - height / 2)
+
+    if not 0.94 <= scale <= 1.06:
+        raise RuntimeError(f"Kameraskalierung außerhalb des Limits ({scale:.3f})")
+    if abs(rotation) > 4.0:
+        raise RuntimeError(f"Kameradrehung außerhalb des Limits ({rotation:.2f} Grad)")
+    if np.hypot(shift_x, shift_y) > 80:
+        raise RuntimeError(
+            f"Kameraverschiebung außerhalb des Limits ({shift_x:.1f}, {shift_y:.1f} px)"
+        )
+
+    details = {
+        "status": "aligned",
+        "reference": ALIGNMENT_REFERENCE_FILE.name,
+        "shift_x": round(shift_x, 2),
+        "shift_y": round(shift_y, 2),
+        "rotation": round(rotation, 3),
+        "scale": round(scale, 4),
+        "inliers": inlier_count,
+        "matches": len(good),
+        "quality": round(inlier_ratio, 3),
+        "mean_error": round(mean_error, 3),
+    }
+    return matrix, details
+
+
+def align_frames(frames: list[np.ndarray]) -> tuple[list[np.ndarray], dict]:
+    """Align one capture burst to the canonical frame before OCR."""
+    reference = load_alignment_reference()
+    if reference is None:
+        reference = save_alignment_reference(frames[len(frames) // 2])
+        return frames, {
+            "status": "reference_created",
+            "reference": ALIGNMENT_REFERENCE_FILE.name,
+            "shift_x": 0.0,
+            "shift_y": 0.0,
+            "rotation": 0.0,
+            "scale": 1.0,
+            "quality": 1.0,
+        }
+    if reference.shape != frames[0].shape:
+        raise RuntimeError(
+            f"Ausrichtungsreferenz hat falsche Größe {reference.shape}, erwartet {frames[0].shape}"
+        )
+
+    candidates = [frames[len(frames) // 2], frames[-1], frames[0]]
+    estimates = []
+    errors = []
+    for candidate in candidates:
+        try:
+            matrix, details = estimate_alignment(candidate, reference)
+            estimates.append((details["inliers"], -details["mean_error"], matrix, details))
+        except RuntimeError as exc:
+            errors.append(str(exc))
+    if not estimates:
+        raise RuntimeError(f"Kameraausrichtung fehlgeschlagen: {'; '.join(errors)}")
+
+    _, _, matrix, details = max(estimates, key=lambda item: item[:2])
+    height, width = reference.shape[:2]
+    aligned = [
+        cv2.warpAffine(
+            frame,
+            matrix,
+            (width, height),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        for frame in frames
+    ]
+    return aligned, details
+
+
 def configure_camera() -> None:
     settings = get_camera_settings()
     controls = [
@@ -211,7 +393,7 @@ def configure_camera() -> None:
         time.sleep(0.2)
 
 
-def capture_frames() -> list[np.ndarray]:
+def capture_frames() -> tuple[list[np.ndarray], dict]:
     with CAMERA_LOCK:
         camera = cv2.VideoCapture(DEVICE, cv2.CAP_V4L2)
         camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -233,7 +415,7 @@ def capture_frames() -> list[np.ndarray]:
             camera.release()
         if len(frames) < 3:
             raise RuntimeError(f"Nur {len(frames)} Kamerabilder empfangen")
-        return frames
+        return align_frames(frames)
 
 
 def segment_scores(frame: np.ndarray) -> list[dict[str, float]]:
@@ -434,8 +616,9 @@ def publish_error(message: str, timestamp: str) -> None:
 def measure_once() -> None:
     timestamp = utc_now()
     previous = load_previous_value()
+    alignment = None
     try:
-        frames = capture_frames()
+        frames, alignment = capture_frames()
         readings = []
         for frame in frames:
             try:
@@ -475,6 +658,7 @@ def measure_once() -> None:
             "samples": counts,
             "interval": get_interval(),
             "camera": get_camera_settings(),
+            "alignment": alignment,
             "error": None,
         }
         atomic_write(DATA_DIR / "status.json", json.dumps(status, indent=2).encode("utf-8"))
@@ -486,7 +670,10 @@ def measure_once() -> None:
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
         with STATE_LOCK:
-            STATE.update({"status": "error", "updated_at": timestamp, "error": message})
+            update = {"status": "error", "updated_at": timestamp, "error": message}
+            if alignment is not None:
+                update["alignment"] = alignment
+            STATE.update(update)
         publish_error(message, timestamp)
         print(f"{timestamp} FEHLER: {message}", flush=True)
 
@@ -517,6 +704,15 @@ class ApiHandler(BaseHTTPRequestHandler):
         if self.path == "/api/camera":
             self.send_bytes(
                 json.dumps({"camera": get_camera_settings()}, indent=2).encode("utf-8"),
+                "application/json",
+            )
+            return
+        if self.path == "/api/alignment":
+            with STATE_LOCK:
+                alignment = dict(STATE.get("alignment") or {})
+            alignment["reference_exists"] = ALIGNMENT_REFERENCE_FILE.exists()
+            self.send_bytes(
+                json.dumps({"alignment": alignment}, indent=2).encode("utf-8"),
                 "application/json",
             )
             return

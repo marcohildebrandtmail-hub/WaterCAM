@@ -22,6 +22,7 @@ Die Integration bindet den Wasserzähler als eigenständiges **Home Assistant Ge
   - Vollständiger Mustervergleich statt einer störanfälligen globalen Pixelschwelle.
   - Zeitlicher Median und Mehrheitsprüfung über den gesamten Aufnahmestapel.
   - Physikalische Plausibilitätsprüfung gegen die maximale Durchflussmenge des Zählers.
+  - Automatischer Nachtschutz: Bei zu dunklem Kamerabild wird höchstens alle 30 Minuten erneut geprüft; eine manuelle Messung bleibt sofort möglich.
 - 📐 **Automatische Bildausrichtung:** Kleine Verschiebungen, Drehungen und Abstandsänderungen der Kamera werden anhand fester Gehäusemerkmale korrigiert, bevor die OCR-Boxen ausgewertet werden.
 - 🔄 **On-Demand Messung:** Button `button.watercam_jetzt_auslesen` triggert per Klick sofort eine Neu-Messung via API.
 - 🎛️ **Kamerasteuerung:** Manueller Fokus, Helligkeit, Belichtungszeit und automatische/manuelle Belichtung direkt am Home-Assistant-Gerät. Autofokus bleibt immer ausgeschaltet.

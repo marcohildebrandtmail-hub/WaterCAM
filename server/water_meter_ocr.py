@@ -77,6 +77,10 @@ MIN_CONSENSUS_CONFIDENCE = 1.5
 METER_MAX_FLOW_M3_PER_HOUR = 4.0
 FLOW_RATE_SAFETY_FACTOR = 1.5
 MIN_ALLOWED_DELTA_M3 = 0.005
+NIGHT_MIN_INTERVAL_SECONDS = max(
+    1800, int(os.getenv("NIGHT_MIN_INTERVAL_SECONDS", "1800"))
+)
+DARK_FRAME_MEAN_THRESHOLD = float(os.getenv("DARK_FRAME_MEAN_THRESHOLD", "35"))
 
 STATE_LOCK = threading.Lock()
 CAMERA_LOCK = threading.Lock()
@@ -103,6 +107,9 @@ STATE = {
     "last_success_at": None,
     "confidence": None,
     "interval": INTERVAL_SECONDS,
+    "effective_interval": INTERVAL_SECONDS,
+    "night_protection": False,
+    "night_retry_after": None,
     "camera": dict(CAMERA_SETTINGS),
     "alignment": {
         "status": "starting",
@@ -112,9 +119,26 @@ STATE = {
 }
 
 
+class FrameTooDarkError(RuntimeError):
+    """Raised when the camera image is too dark for a reliable reading."""
+
+    def __init__(self, brightness: float) -> None:
+        self.brightness = brightness
+        super().__init__(
+            f"Bild zu dunkel (Helligkeit {brightness:.1f}, "
+            f"Minimum {DARK_FRAME_MEAN_THRESHOLD:.1f})"
+        )
+
+
 def get_interval() -> int:
     with STATE_LOCK:
         return INTERVAL_SECONDS
+
+
+def get_effective_interval(night_protection: bool = False) -> int:
+    """Return the configured interval with the mandatory night minimum."""
+    interval = get_interval()
+    return max(interval, NIGHT_MIN_INTERVAL_SECONDS) if night_protection else interval
 
 
 def set_interval(seconds: int) -> int:
@@ -421,7 +445,19 @@ def capture_frames() -> tuple[list[np.ndarray], dict]:
             camera.release()
         if len(frames) < 3:
             raise RuntimeError(f"Nur {len(frames)} Kamerabilder empfangen")
-        return align_frames(frames)
+        ambient_brightness = float(
+            np.median(
+                [
+                    cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).mean()
+                    for frame in frames
+                ]
+            )
+        )
+        if ambient_brightness < DARK_FRAME_MEAN_THRESHOLD:
+            raise FrameTooDarkError(ambient_brightness)
+        aligned, details = align_frames(frames)
+        details["ambient_brightness"] = round(ambient_brightness, 1)
+        return aligned, details
 
 
 def segment_scores(frame: np.ndarray) -> list[dict[str, float]]:
@@ -689,7 +725,7 @@ def publish_error(message: str, timestamp: str) -> None:
         pass
 
 
-def measure_once() -> None:
+def measure_once() -> str:
     timestamp = utc_now()
     current_timestamp = datetime.fromisoformat(timestamp)
     previous, previous_timestamp = load_previous_reading()
@@ -741,6 +777,9 @@ def measure_once() -> None:
             "confidence": confidence,
             "samples": counts,
             "interval": get_interval(),
+            "effective_interval": get_interval(),
+            "night_protection": False,
+            "night_retry_after": None,
             "camera": get_camera_settings(),
             "alignment": alignment,
             "error": None,
@@ -751,15 +790,42 @@ def measure_once() -> None:
         publish_success(value, raw, confidence, timestamp)
         push_webhook(status)
         print(f"{timestamp} gelesen: {raw} m³ (Sicherheit {confidence:.2f})", flush=True)
+        return "ok"
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
+        is_dark = isinstance(exc, FrameTooDarkError)
+        effective_interval = get_effective_interval(is_dark)
+        retry_after = (
+            datetime.fromtimestamp(
+                current_timestamp.timestamp() + effective_interval,
+                tz=timezone.utc,
+            ).isoformat()
+            if is_dark
+            else None
+        )
         with STATE_LOCK:
-            update = {"status": "error", "updated_at": timestamp, "error": message}
+            update = {
+                "status": "error",
+                "updated_at": timestamp,
+                "error": message,
+                "effective_interval": effective_interval,
+                "night_protection": is_dark,
+                "night_retry_after": retry_after,
+            }
+            if is_dark:
+                update["ambient_brightness"] = round(exc.brightness, 1)
             if alignment is not None:
                 update["alignment"] = alignment
             STATE.update(update)
         publish_error(message, timestamp)
         print(f"{timestamp} FEHLER: {message}", flush=True)
+        if is_dark:
+            print(
+                f"Nachtschutz aktiv: nächster automatischer Versuch frühestens "
+                f"in {effective_interval}s",
+                flush=True,
+            )
+        return "dark" if is_dark else "error"
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -935,11 +1001,12 @@ def main() -> None:
     try:
         while not STOP_EVENT.is_set():
             cycle_started = time.monotonic()
-            measure_once()
+            outcome = measure_once()
             if STOP_EVENT.is_set():
                 break
             elapsed = time.monotonic() - cycle_started
-            MEASURE_WAKEUP_EVENT.wait(timeout=max(0, get_interval() - elapsed))
+            effective_interval = get_effective_interval(outcome == "dark")
+            MEASURE_WAKEUP_EVENT.wait(timeout=max(0, effective_interval - elapsed))
             MEASURE_WAKEUP_EVENT.clear()
     finally:
         server.shutdown()

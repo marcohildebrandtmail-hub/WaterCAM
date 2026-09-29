@@ -10,11 +10,13 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfVolume
+from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN, UnitOfVolume
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from .const import DEFAULT_NAME, DOMAIN, MANUFACTURER, MODEL, SW_VERSION
 from .coordinator import WatercamDataUpdateCoordinator
@@ -35,6 +37,18 @@ async def async_setup_entry(
             WatercamZaehlerstandSensor(coordinator, entry),
             WatercamSicherheitSensor(coordinator, entry),
             WatercamRawDisplaySensor(coordinator, entry),
+            WatercamVerbrauchSensor(
+                coordinator, entry, "verbrauch_tag", "day", "mdi:calendar-today"
+            ),
+            WatercamVerbrauchSensor(
+                coordinator, entry, "verbrauch_woche", "week", "mdi:calendar-week"
+            ),
+            WatercamVerbrauchSensor(
+                coordinator, entry, "verbrauch_monat", "month", "mdi:calendar-month"
+            ),
+            WatercamVerbrauchSensor(
+                coordinator, entry, "verbrauch_jahr", "year", "mdi:calendar-range"
+            ),
         ]
     )
 
@@ -150,3 +164,119 @@ class WatercamRawDisplaySensor(WatercamBaseEntity, SensorEntity):
         if not self.coordinator.data:
             return None
         return self.coordinator.data.get("raw")
+
+
+class WatercamVerbrauchSensor(WatercamBaseEntity, RestoreEntity, SensorEntity):
+    """Sensor tracking water consumption in Liters for a specific time period."""
+
+    _attr_device_class = SensorDeviceClass.WATER
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_native_unit_of_measurement = UnitOfVolume.LITERS
+    _attr_suggested_display_precision = 1
+
+    def __init__(
+        self,
+        coordinator: WatercamDataUpdateCoordinator,
+        entry: ConfigEntry,
+        key: str,
+        period_type: str,
+        icon: str,
+    ) -> None:
+        """Initialize the periodic consumption sensor."""
+        super().__init__(coordinator, entry, key)
+        self._attr_translation_key = key
+        self._attr_icon = icon
+        self._period_type = period_type
+        self._period_key: str | None = None
+        self._baseline_reading: float | None = None
+        self._consumption_liters: float = 0.0
+
+    def _get_current_period_key(self) -> str:
+        """Return the period key according to local time."""
+        now = dt_util.now()
+        if self._period_type == "day":
+            return now.strftime("%Y-%m-%d")
+        if self._period_type == "week":
+            iso = now.isocalendar()
+            return f"{iso.year}-W{iso.week:02d}"
+        if self._period_type == "month":
+            return now.strftime("%Y-%m")
+        if self._period_type == "year":
+            return now.strftime("%Y")
+        return now.strftime("%Y-%m-%d")
+
+    async def async_added_to_hass(self) -> None:
+        """Restore last state and baseline upon startup."""
+        await super().async_added_to_hass()
+        current_period = self._get_current_period_key()
+        last_state = await self.async_get_last_state()
+
+        if last_state and last_state.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            attrs = last_state.attributes
+            stored_period = attrs.get("period_key")
+            stored_baseline = attrs.get("baseline_reading_m3")
+
+            if stored_period == current_period and stored_baseline is not None:
+                try:
+                    self._period_key = stored_period
+                    self._baseline_reading = float(stored_baseline)
+                    self._consumption_liters = float(last_state.state)
+                except (ValueError, TypeError):
+                    self._period_key = current_period
+                    self._baseline_reading = None
+                    self._consumption_liters = 0.0
+            else:
+                self._period_key = current_period
+                self._baseline_reading = None
+                self._consumption_liters = 0.0
+        else:
+            self._period_key = current_period
+            self._baseline_reading = None
+            self._consumption_liters = 0.0
+
+        self._update_consumption()
+
+    def _update_consumption(self) -> None:
+        """Calculate consumption in Liters from coordinator reading."""
+        if not self.coordinator.data:
+            return
+        val = self.coordinator.data.get("value")
+        if val is None:
+            return
+        try:
+            current_reading = float(val)
+        except (ValueError, TypeError):
+            return
+
+        current_period = self._get_current_period_key()
+        if self._period_key != current_period or self._baseline_reading is None:
+            self._period_key = current_period
+            self._baseline_reading = current_reading
+            self._consumption_liters = 0.0
+        else:
+            delta = current_reading - self._baseline_reading
+            if delta < 0:
+                self._baseline_reading = current_reading
+                self._consumption_liters = 0.0
+            else:
+                self._consumption_liters = round(delta * 1000.0, 1)
+
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        self._update_consumption()
+        super()._handle_coordinator_update()
+
+    @property
+    def native_value(self) -> float | None:
+        """Return current period consumption in Liters."""
+        return self._consumption_liters
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return period and baseline attributes."""
+        return {
+            "period": self._period_type,
+            "period_key": self._period_key,
+            "baseline_reading_m3": self._baseline_reading,
+            "unit": "L",
+        }

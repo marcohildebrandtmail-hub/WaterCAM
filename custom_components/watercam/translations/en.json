@@ -27,6 +27,18 @@
       },
       "rohanzeige": {
         "name": "Raw Display"
+      },
+      "verbrauch_tag": {
+        "name": "Consumption Today"
+      },
+      "verbrauch_woche": {
+        "name": "Consumption This Week"
+      },
+      "verbrauch_monat": {
+        "name": "Consumption This Month"
+      },
+      "verbrauch_jahr": {
+        "name": "Consumption This Year"
       }
     },
     "binary_sensor": {
@@ -45,6 +57,25 @@
     "button": {
       "measure_now": {
         "name": "Read Now"
+      }
+    },
+    "number": {
+      "messintervall": {
+        "name": "OCR Measurement Interval"
+      },
+      "focus": {
+        "name": "Focus"
+      },
+      "brightness": {
+        "name": "Brightness"
+      },
+      "exposure_time": {
+        "name": "Exposure time"
+      }
+    },
+    "switch": {
+      "exposure_auto": {
+        "name": "Automatic exposure"
       }
     }
   }

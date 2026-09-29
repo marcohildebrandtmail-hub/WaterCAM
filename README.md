@@ -21,6 +21,8 @@ Die Integration bindet den Wasserzähler als eigenständiges **Home Assistant Ge
   - Robuste Segment-Abtastung für 6 Großziffern und 3 Nachkomma-Kleinziffern.
   - Dynamische Schwellenwertermittlung mit Hamming-Distanz-Absicherung.
 - 🔄 **On-Demand Messung:** Button `button.watercam_jetzt_auslesen` triggert per Klick sofort eine Neu-Messung via API.
+- 🎛️ **Kamerasteuerung:** Manueller Fokus, Helligkeit, Belichtungszeit und automatische/manuelle Belichtung direkt am Home-Assistant-Gerät. Autofokus bleibt immer ausgeschaltet.
+- ⏱️ **Messintervall:** Das OCR-Intervall lässt sich direkt in Home Assistant konfigurieren.
 - 🌐 **UI Konfigurations-Flow:** Bequemes Hinzufügen über *Einstellungen → Geräte & Dienste*.
 
 ---
@@ -36,6 +38,11 @@ Die Integration bindet den Wasserzähler als eigenständiges **Home Assistant Ge
 | **Camera** | `camera.watercam_live_snapshot` | Live-Kamerabild (Annotiert) | Vollbild mit Erkennungs-Boxen (`/snapshot.jpg`) |
 | **Camera** | `camera.watercam_lcd_display` | LCD-Display | Reiner LCD-Ausschnitt (`/display.jpg`) |
 | **Button** | `button.watercam_jetzt_auslesen` | Jetzt auslesen | Triggert sofort eine neue Messung |
+| **Number** | `number.watercam_fokus` | Fokus | Manueller Kamerafokus (`0–40`) |
+| **Number** | `number.watercam_helligkeit` | Helligkeit | Kamerabild-Helligkeit (`30–255`) |
+| **Number** | `number.watercam_belichtungszeit` | Belichtungszeit | Manuelle Belichtungszeit in Millisekunden |
+| **Switch** | `switch.watercam_belichtung_automatisch` | Belichtung automatisch | Schaltet zwischen automatischer und manueller Belichtung um |
+| **Number** | `number.watercam_ocr_messintervall` | OCR Messintervall | Zeit zwischen automatischen Messungen in Sekunden |
 
 ---
 
@@ -68,6 +75,9 @@ Der Server läuft als schlanker Dienst in einem Debian LXC Container (z.B. CT 12
 ### REST-API Endpunkte (Port 8080):
 - `GET /api/status`: JSON-Status mit Zählerstand, Rohwerten, Zeitstempel und Sicherheit.
 - `POST /api/measure`: Triggert sofortige neue Messung.
+- `GET /api/camera`: Liefert die gespeicherten Kameraeinstellungen.
+- `POST /api/camera`: Speichert Kameraeinstellungen und triggert eine neue Messung.
+- `POST /api/interval`: Speichert das OCR-Messintervall.
 - `GET /snapshot.jpg`: Zuletzt aufgenommenes Vollbild mit Visualisierungs-Boxen.
 - `GET /display.jpg`: Direkter LCD-Display-Ausschnitt.
 

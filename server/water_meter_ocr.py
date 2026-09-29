@@ -29,15 +29,15 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "/var/lib/water-meter-ocr"))
 
 # Calibrated for the fixed LifeCam position. Coordinates are x1, y1, x2, y2.
 DIGIT_BOXES = [
-    (472, 301, 505, 368),
-    (511, 303, 545, 367),
-    (547, 301, 584, 365),
-    (585, 302, 624, 365),
-    (624, 301, 664, 365),
-    (664, 301, 701, 365),
-    (706, 318, 729, 364),
-    (734, 315, 759, 361),
-    (758, 314, 788, 361),
+    (468, 297, 505, 364),
+    (511, 295, 543, 363),
+    (551, 297, 582, 357),
+    (587, 298, 622, 357),
+    (624, 297, 662, 361),
+    (660, 297, 697, 357),
+    (704, 310, 727, 364),
+    (730, 311, 755, 359),
+    (757, 310, 785, 357),
 ]
 
 LARGE_SAMPLE_REGIONS = {
@@ -76,14 +76,108 @@ SEGMENT_DIGITS = {
 STATE_LOCK = threading.Lock()
 CAMERA_LOCK = threading.Lock()
 STOP_EVENT = threading.Event()
+MEASURE_WAKEUP_EVENT = threading.Event()
+INTERVAL_FILE = DATA_DIR / "interval.txt"
+CAMERA_SETTINGS_FILE = DATA_DIR / "camera_settings.json"
+CAMERA_SETTINGS_LOCK = threading.Lock()
+CAMERA_SETTINGS = {
+    "focus": 20,
+    "brightness": 133,
+    "exposure_auto": True,
+    "exposure_time": 600,
+}
 STATE = {
     "status": "starting",
     "value": None,
     "raw": None,
+    "unit": "m³",
     "updated_at": None,
     "confidence": None,
+    "interval": INTERVAL_SECONDS,
+    "camera": dict(CAMERA_SETTINGS),
     "error": None,
 }
+
+
+def get_interval() -> int:
+    with STATE_LOCK:
+        return INTERVAL_SECONDS
+
+
+def set_interval(seconds: int) -> int:
+    global INTERVAL_SECONDS
+    seconds = max(10, min(86400, int(seconds)))
+    with STATE_LOCK:
+        INTERVAL_SECONDS = seconds
+        STATE["interval"] = seconds
+    try:
+        atomic_write(INTERVAL_FILE, str(seconds).encode("utf-8"))
+    except Exception as exc:
+        print(f"Fehler beim Speichern des Intervalls: {exc}", flush=True)
+    return seconds
+
+
+def load_interval() -> int:
+    global INTERVAL_SECONDS
+    if INTERVAL_FILE.exists():
+        try:
+            val = int(INTERVAL_FILE.read_text(encoding="utf-8").strip())
+            if 10 <= val <= 86400:
+                INTERVAL_SECONDS = val
+        except Exception:
+            pass
+    with STATE_LOCK:
+        STATE["interval"] = INTERVAL_SECONDS
+    return INTERVAL_SECONDS
+
+
+def get_camera_settings() -> dict:
+    with CAMERA_SETTINGS_LOCK:
+        return dict(CAMERA_SETTINGS)
+
+
+def load_camera_settings() -> dict:
+    if CAMERA_SETTINGS_FILE.exists():
+        try:
+            saved = json.loads(CAMERA_SETTINGS_FILE.read_text(encoding="utf-8"))
+            update_camera_settings(saved, persist=False, wake=False)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            print(f"Kameraeinstellungen konnten nicht geladen werden: {exc}", flush=True)
+    settings = get_camera_settings()
+    with STATE_LOCK:
+        STATE["camera"] = settings
+    return settings
+
+
+def update_camera_settings(updates: dict, *, persist: bool = True, wake: bool = True) -> dict:
+    validated = {}
+    if "focus" in updates:
+        validated["focus"] = max(0, min(40, int(updates["focus"])))
+    if "brightness" in updates:
+        validated["brightness"] = max(30, min(255, int(updates["brightness"])))
+    if "exposure_auto" in updates:
+        value = updates["exposure_auto"]
+        if isinstance(value, str):
+            value = value.strip().lower() in ("1", "true", "on", "yes")
+        validated["exposure_auto"] = bool(value)
+    if "exposure_time" in updates:
+        validated["exposure_time"] = max(1, min(10000, int(updates["exposure_time"])))
+    if not validated:
+        raise ValueError("Keine gültigen Kameraeinstellungen übergeben")
+
+    with CAMERA_SETTINGS_LOCK:
+        CAMERA_SETTINGS.update(validated)
+        settings = dict(CAMERA_SETTINGS)
+    with STATE_LOCK:
+        STATE["camera"] = settings
+    if persist:
+        atomic_write(
+            CAMERA_SETTINGS_FILE,
+            json.dumps(settings, indent=2).encode("utf-8"),
+        )
+    if wake:
+        MEASURE_WAKEUP_EVENT.set()
+    return settings
 
 
 def utc_now() -> str:
@@ -97,12 +191,17 @@ def atomic_write(path: Path, data: bytes) -> None:
 
 
 def configure_camera() -> None:
-    for control in (
+    settings = get_camera_settings()
+    controls = [
         "power_line_frequency=1",
-        "auto_exposure=3",
+        f"brightness={settings['brightness']}",
         "focus_automatic_continuous=0",
-        "focus_absolute=20",
-    ):
+        f"focus_absolute={settings['focus']}",
+        f"auto_exposure={3 if settings['exposure_auto'] else 1}",
+    ]
+    if not settings["exposure_auto"]:
+        controls.append(f"exposure_time_absolute={settings['exposure_time']}")
+    for control in controls:
         subprocess.run(
             ["v4l2-ctl", "-d", DEVICE, f"--set-ctrl={control}"],
             check=True,
@@ -118,16 +217,17 @@ def capture_frames() -> list[np.ndarray]:
         camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         configure_camera()
         frames = []
         try:
             # Auto exposure needs roughly two seconds after opening the LifeCam,
             # especially when the utility room changes from daylight to darkness.
-            for index in range(75):
+            for index in range(90):
                 ok, frame = camera.read()
                 if not ok:
                     continue
-                if index >= 70:
+                if index >= 75:
                     frames.append(frame)
         finally:
             camera.release()
@@ -313,7 +413,9 @@ def push_webhook(payload: dict) -> None:
 
 
 def publish_error(message: str, timestamp: str) -> None:
-    push_webhook({"status": "error", "updated_at": timestamp, "error": message})
+    with STATE_LOCK:
+        payload = dict(STATE)
+    push_webhook(payload)
     try:
         ha_set_state(
             "binary_sensor.wasserzaehler_ocr_status",
@@ -371,6 +473,8 @@ def measure_once() -> None:
             "updated_at": timestamp,
             "confidence": confidence,
             "samples": counts,
+            "interval": get_interval(),
+            "camera": get_camera_settings(),
             "error": None,
         }
         atomic_write(DATA_DIR / "status.json", json.dumps(status, indent=2).encode("utf-8"))
@@ -410,6 +514,12 @@ class ApiHandler(BaseHTTPRequestHandler):
             status = 200 if state["status"] == "ok" or self.path != "/health" else 503
             self.send_bytes(json.dumps(state, indent=2).encode("utf-8"), "application/json", status)
             return
+        if self.path == "/api/camera":
+            self.send_bytes(
+                json.dumps({"camera": get_camera_settings()}, indent=2).encode("utf-8"),
+                "application/json",
+            )
+            return
         paths = {
             "/snapshot.jpg": DATA_DIR / "snapshot.jpg",
             "/display.jpg": DATA_DIR / "display.jpg",
@@ -422,17 +532,58 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if self.path in ("/api/measure", "/measure"):
-            def run_measure():
-                try:
-                    measure_once()
-                except Exception as exc:
-                    print(f"Manuelle Messung fehlgeschlagen: {exc}", flush=True)
-
-            threading.Thread(target=run_measure, name="manual-measure", daemon=True).start()
+            MEASURE_WAKEUP_EVENT.set()
             self.send_bytes(
                 json.dumps({"status": "accepted", "message": "Messung gestartet"}).encode("utf-8"),
                 "application/json",
                 202,
+            )
+            return
+        if self.path == "/api/camera":
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
+                settings = update_camera_settings(body)
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                self.send_bytes(
+                    json.dumps({"error": str(exc)}).encode("utf-8"),
+                    "application/json",
+                    400,
+                )
+                return
+            print(f"Kameraeinstellungen aktualisiert: {settings}", flush=True)
+            with STATE_LOCK:
+                current_state = dict(STATE)
+            threading.Thread(target=push_webhook, args=(current_state,), daemon=True).start()
+            self.send_bytes(
+                json.dumps({"status": "accepted", "camera": settings}).encode("utf-8"),
+                "application/json",
+                202,
+            )
+            return
+        if self.path in ("/api/interval", "/interval"):
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
+            new_interval = body.get("interval")
+            if new_interval is not None:
+                try:
+                    ival = int(new_interval)
+                    if 10 <= ival <= 86400:
+                        set_interval(ival)
+                        MEASURE_WAKEUP_EVENT.set()
+                        print(f"Messintervall auf {ival}s aktualisiert", flush=True)
+                        self.send_bytes(
+                            json.dumps({"status": "ok", "interval": ival}).encode("utf-8"),
+                            "application/json",
+                            200,
+                        )
+                        return
+                except (ValueError, TypeError):
+                    pass
+            self.send_bytes(
+                json.dumps({"error": "invalid interval (10-86400 seconds required)"}).encode("utf-8"),
+                "application/json",
+                400,
             )
             return
         if self.path in ("/api/webhook_register", "/api/webhook"):
@@ -462,10 +613,12 @@ class ApiHandler(BaseHTTPRequestHandler):
 
 def signal_handler(_signum, _frame) -> None:
     STOP_EVENT.set()
+    MEASURE_WAKEUP_EVENT.set()
 
 
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    load_interval()
     previous_path = DATA_DIR / "status.json"
     previous_state = None
     if previous_path.exists():
@@ -473,8 +626,10 @@ def main() -> None:
             previous_state = json.loads(previous_path.read_text(encoding="utf-8"))
             with STATE_LOCK:
                 STATE.update(previous_state)
+                STATE["unit"] = "m³"
         except (OSError, json.JSONDecodeError):
             pass
+    load_camera_settings()
 
     # Recreate the HA entities immediately after a service or HA restart. A
     # rejected camera frame must not prevent the last confirmed total from
@@ -497,7 +652,10 @@ def main() -> None:
     try:
         while not STOP_EVENT.is_set():
             measure_once()
-            STOP_EVENT.wait(INTERVAL_SECONDS)
+            if STOP_EVENT.is_set():
+                break
+            MEASURE_WAKEUP_EVENT.wait(timeout=get_interval())
+            MEASURE_WAKEUP_EVENT.clear()
     finally:
         server.shutdown()
         server.server_close()

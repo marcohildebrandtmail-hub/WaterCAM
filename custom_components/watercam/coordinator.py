@@ -74,7 +74,52 @@ class WatercamDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.warning("Fehler beim Triggern der manuellen Messung: %s", err)
             return False
 
+    async def async_set_interval(self, seconds: int) -> bool:
+        """Set OCR measurement interval on the WaterCAM container."""
+        url = f"{self.base_url}/api/interval"
+        try:
+            payload = {"interval": int(seconds)}
+            async with self.session.post(
+                url, json=payload, timeout=aiohttp.ClientTimeout(total=10)
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    interval = data.get("interval", seconds)
+                    if self.data is not None:
+                        new_data = dict(self.data)
+                        new_data["interval"] = interval
+                        self.async_set_updated_data(new_data)
+                    _LOGGER.info("WaterCAM Messintervall erfolgreich auf %ss gesetzt", interval)
+                    return True
+                _LOGGER.warning("WaterCAM Intervall-Aktualisierung antwortete mit HTTP %s", response.status)
+        except Exception as err:
+            _LOGGER.warning("Fehler beim Setzen des Messintervalls (%s): %s", url, err)
+        return False
+
+    async def async_set_camera_settings(self, settings: dict[str, Any]) -> bool:
+        """Persist camera controls and trigger a fresh OCR measurement."""
+        url = f"{self.base_url}/api/camera"
+        try:
+            async with self.session.post(
+                url, json=settings, timeout=aiohttp.ClientTimeout(total=10)
+            ) as response:
+                if response.status in (200, 202):
+                    result = await response.json()
+                    camera = result.get("camera", settings)
+                    new_data = dict(self.data or {})
+                    new_data["camera"] = camera
+                    self.async_set_updated_data(new_data)
+                    return True
+                _LOGGER.warning(
+                    "WaterCAM Kameraeinstellung antwortete mit HTTP %s", response.status
+                )
+        except Exception as err:
+            _LOGGER.warning("Fehler beim Setzen der Kameraeinstellung (%s): %s", url, err)
+        return False
+
     def async_receive_push(self, data: dict[str, Any]) -> None:
         """Process real-time data pushed from the WaterCAM container."""
         _LOGGER.debug("WaterCAM Live-Push empfangen: %s", data)
-        self.async_set_updated_data(data)
+        merged = dict(self.data or {})
+        merged.update(data)
+        self.async_set_updated_data(merged)

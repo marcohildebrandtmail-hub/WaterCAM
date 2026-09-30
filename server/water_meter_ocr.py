@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from itertools import product
 import os
 from pathlib import Path
 import signal
@@ -81,6 +82,16 @@ NIGHT_MIN_INTERVAL_SECONDS = max(
     1800, int(os.getenv("NIGHT_MIN_INTERVAL_SECONDS", "1800"))
 )
 DARK_FRAME_MEAN_THRESHOLD = float(os.getenv("DARK_FRAME_MEAN_THRESHOLD", "35"))
+MAX_ALIGNMENT_ROTATION_DEGREES = float(
+    os.getenv("MAX_ALIGNMENT_ROTATION_DEGREES", "12")
+)
+MIN_ALIGNMENT_SCALE = float(os.getenv("MIN_ALIGNMENT_SCALE", "0.90"))
+MAX_ALIGNMENT_SCALE = float(os.getenv("MAX_ALIGNMENT_SCALE", "1.10"))
+MAX_ALIGNMENT_SHIFT_PIXELS = float(os.getenv("MAX_ALIGNMENT_SHIFT_PIXELS", "180"))
+MIN_ALIGNMENT_INLIERS = int(os.getenv("MIN_ALIGNMENT_INLIERS", "20"))
+MIN_ALIGNMENT_INLIER_RATIO = float(os.getenv("MIN_ALIGNMENT_INLIER_RATIO", "0.40"))
+MAX_ALIGNMENT_MEAN_ERROR = float(os.getenv("MAX_ALIGNMENT_MEAN_ERROR", "2.25"))
+MIN_CONSTRAINED_CONFIDENCE = float(os.getenv("MIN_CONSTRAINED_CONFIDENCE", "0.75"))
 
 STATE_LOCK = threading.Lock()
 CAMERA_LOCK = threading.Lock()
@@ -317,7 +328,10 @@ def estimate_alignment(
     inliers = inlier_mask.ravel().astype(bool)
     inlier_count = int(inliers.sum())
     inlier_ratio = inlier_count / len(good)
-    if inlier_count < 10 or inlier_ratio < 0.35:
+    if (
+        inlier_count < MIN_ALIGNMENT_INLIERS
+        or inlier_ratio < MIN_ALIGNMENT_INLIER_RATIO
+    ):
         raise RuntimeError(
             f"Kameraausrichtung unsicher ({inlier_count}/{len(good)} Merkmale)"
         )
@@ -332,14 +346,31 @@ def estimate_alignment(
     shift_x = float(aligned_center[0] - width / 2)
     shift_y = float(aligned_center[1] - height / 2)
 
-    if not 0.94 <= scale <= 1.06:
+    if mean_error > MAX_ALIGNMENT_MEAN_ERROR:
+        raise RuntimeError(
+            f"Kameraausrichtung hat zu hohen Restfehler ({mean_error:.2f} px)"
+        )
+    if not MIN_ALIGNMENT_SCALE <= scale <= MAX_ALIGNMENT_SCALE:
         raise RuntimeError(f"Kameraskalierung außerhalb des Limits ({scale:.3f})")
-    if abs(rotation) > 4.0:
+    if abs(rotation) > MAX_ALIGNMENT_ROTATION_DEGREES:
         raise RuntimeError(f"Kameradrehung außerhalb des Limits ({rotation:.2f} Grad)")
-    if np.hypot(shift_x, shift_y) > 80:
+    if np.hypot(shift_x, shift_y) > MAX_ALIGNMENT_SHIFT_PIXELS:
         raise RuntimeError(
             f"Kameraverschiebung außerhalb des Limits ({shift_x:.1f}, {shift_y:.1f} px)"
         )
+
+    # The transform may be mathematically sound while moving the OCR crop beyond
+    # the captured frame. Reject it unless all LCD corners still have real pixels.
+    inverse = cv2.invertAffineTransform(matrix)
+    display_corners = np.float32(
+        [[[410, 275], [890, 275], [890, 470], [410, 470]]]
+    )
+    source_corners = cv2.transform(display_corners, inverse)[0]
+    if not all(
+        0 <= point[0] < width and 0 <= point[1] < height
+        for point in source_corners
+    ):
+        raise RuntimeError("LCD-Bereich liegt nach Kameraausrichtung teilweise außerhalb des Bildes")
 
     details = {
         "status": "aligned",
@@ -414,12 +445,18 @@ def configure_camera() -> None:
     if not settings["exposure_auto"]:
         controls.append(f"exposure_time_absolute={settings['exposure_time']}")
     for control in controls:
-        subprocess.run(
+        result = subprocess.run(
             ["v4l2-ctl", "-d", DEVICE, f"--set-ctrl={control}"],
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
         )
+        if result.returncode != 0:
+            print(
+                f"Kamerasteuerung nicht unterstützt ({control}): "
+                f"{result.stderr.strip()}",
+                flush=True,
+            )
         time.sleep(0.2)
 
 
@@ -445,6 +482,12 @@ def capture_frames() -> tuple[list[np.ndarray], dict]:
             camera.release()
         if len(frames) < 3:
             raise RuntimeError(f"Nur {len(frames)} Kamerabilder empfangen")
+        diagnostic_frame = frames[len(frames) // 2]
+        ok_raw, encoded_raw = cv2.imencode(
+            ".jpg", diagnostic_frame, [cv2.IMWRITE_JPEG_QUALITY, 92]
+        )
+        if ok_raw:
+            atomic_write(DATA_DIR / "latest_raw.jpg", encoded_raw.tobytes())
         ambient_brightness = float(
             np.median(
                 [
@@ -456,6 +499,11 @@ def capture_frames() -> tuple[list[np.ndarray], dict]:
         if ambient_brightness < DARK_FRAME_MEAN_THRESHOLD:
             raise FrameTooDarkError(ambient_brightness)
         aligned, details = align_frames(frames)
+        ok_aligned, encoded_aligned = cv2.imencode(
+            ".jpg", aligned[len(aligned) // 2], [cv2.IMWRITE_JPEG_QUALITY, 92]
+        )
+        if ok_aligned:
+            atomic_write(DATA_DIR / "latest_aligned.jpg", encoded_aligned.tobytes())
         details["ambient_brightness"] = round(ambient_brightness, 1)
         return aligned, details
 
@@ -477,6 +525,13 @@ def segment_scores(frame: np.ndarray) -> list[dict[str, float]]:
 
 def classify_digit(digit_scores: dict[str, float]) -> tuple[str, float]:
     """Classify one digit by comparing complete seven-segment patterns."""
+    ranked = rank_digit_patterns(digit_scores)
+    confidence = ranked[0][0] - ranked[1][0]
+    return ranked[0][1], confidence
+
+
+def rank_digit_patterns(digit_scores: dict[str, float]) -> list[tuple[float, str]]:
+    """Return every digit pattern ranked by its segment fit."""
     ranked = []
     for pattern, digit in SEGMENT_DIGITS.items():
         active = [digit_scores[name] for name in pattern]
@@ -494,8 +549,7 @@ def classify_digit(digit_scores: dict[str, float]) -> tuple[str, float]:
         ranked.append((fit, digit))
 
     ranked.sort(key=lambda item: item[0], reverse=True)
-    confidence = ranked[0][0] - ranked[1][0]
-    return ranked[0][1], confidence
+    return ranked
 
 
 def decode_scores(
@@ -517,6 +571,47 @@ def decode_scores(
         )
     raw = "".join(digits[:6]) + "." + "".join(digits[6:])
     return raw, confidence
+
+
+def decode_scores_constrained(
+    scores: list[dict[str, float]],
+    previous: float | None,
+    previous_timestamp: datetime | None,
+    current_timestamp: datetime,
+) -> tuple[str, float]:
+    """Resolve weak segment ambiguities only through physical plausibility."""
+    try:
+        return decode_scores(scores)
+    except ValueError:
+        if previous is None:
+            raise
+
+    ranked_positions = [rank_digit_patterns(item)[:2] for item in scores]
+    candidates = []
+    for combination in product(*ranked_positions):
+        digits = [item[1] for item in combination]
+        raw = "".join(digits[:6]) + "." + "".join(digits[6:])
+        value = float(raw)
+        try:
+            validate_value(value, previous, previous_timestamp, current_timestamp)
+        except ValueError:
+            continue
+        candidates.append((sum(item[0] for item in combination), raw))
+
+    if not candidates:
+        raise ValueError("Keine optisch und physikalisch plausible Lesung gefunden")
+    candidates.sort(reverse=True)
+    best_score, best_raw = candidates[0]
+    confidence = (
+        best_score - candidates[1][0]
+        if len(candidates) > 1
+        else MIN_CONSTRAINED_CONFIDENCE
+    )
+    if confidence < MIN_CONSTRAINED_CONFIDENCE:
+        raise ValueError(
+            f"Plausible Lesungen nicht eindeutig (Sicherheit {confidence:.2f})"
+        )
+    return best_raw, round(confidence, 2)
 
 
 def decode_frame(frame: np.ndarray) -> tuple[str, float, list[dict[str, float]]]:
@@ -738,7 +833,9 @@ def measure_once() -> str:
             scores = segment_scores(frame)
             score_sets.append(scores)
             try:
-                raw, confidence = decode_scores(scores)
+                raw, confidence = decode_scores_constrained(
+                    scores, previous, previous_timestamp, current_timestamp
+                )
                 readings.append((raw, confidence, frame))
             except ValueError:
                 continue
@@ -746,8 +843,11 @@ def measure_once() -> str:
             raise RuntimeError("Keine der Aufnahmen konnte sicher gelesen werden")
 
         raw, confidence, best_frame, counts = select_stable_reading(readings)
-        consensus_raw, consensus_confidence = decode_scores(
-            median_scores(score_sets), MIN_CONSENSUS_CONFIDENCE
+        consensus_raw, consensus_confidence = decode_scores_constrained(
+            median_scores(score_sets),
+            previous,
+            previous_timestamp,
+            current_timestamp,
         )
         if consensus_raw != raw:
             raise RuntimeError(
@@ -869,6 +969,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         paths = {
             "/snapshot.jpg": DATA_DIR / "snapshot.jpg",
             "/display.jpg": DATA_DIR / "display.jpg",
+            "/latest_raw.jpg": DATA_DIR / "latest_raw.jpg",
+            "/latest_aligned.jpg": DATA_DIR / "latest_aligned.jpg",
         }
         path = paths.get(self.path)
         if path and path.exists():

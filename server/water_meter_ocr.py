@@ -26,6 +26,9 @@ LISTEN_HOST = os.getenv("LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.getenv("LISTEN_PORT", "8080"))
 HA_URL = os.getenv("HA_URL", "").rstrip("/")
 HA_TOKEN = os.getenv("HA_TOKEN", "")
+WATER_LIGHT_ENTITY = os.getenv("WATER_LIGHT_ENTITY", "light.wasserzahler_licht")
+WATER_LIGHT_WARMUP_SECONDS = float(os.getenv("WATER_LIGHT_WARMUP_SECONDS", "5"))
+CAMERA_REOPEN_RETRY_SECONDS = float(os.getenv("CAMERA_REOPEN_RETRY_SECONDS", "5"))
 DATA_DIR = Path(os.getenv("DATA_DIR", "/var/lib/water-meter-ocr"))
 
 # Calibrated for the fixed LifeCam position. Coordinates are x1, y1, x2, y2.
@@ -460,14 +463,15 @@ def configure_camera() -> None:
         time.sleep(0.2)
 
 
-def capture_frames() -> tuple[list[np.ndarray], dict]:
+def capture_frames(apply_settings: bool = True) -> tuple[list[np.ndarray], dict]:
     with CAMERA_LOCK:
         camera = cv2.VideoCapture(DEVICE, cv2.CAP_V4L2)
         camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        configure_camera()
+        if apply_settings:
+            configure_camera()
         frames = []
         try:
             # Auto exposure needs roughly two seconds after opening the LifeCam,
@@ -506,6 +510,27 @@ def capture_frames() -> tuple[list[np.ndarray], dict]:
             atomic_write(DATA_DIR / "latest_aligned.jpg", encoded_aligned.tobytes())
         details["ambient_brightness"] = round(ambient_brightness, 1)
         return aligned, details
+
+
+def capture_frames_after_lighting() -> tuple[list[np.ndarray], dict]:
+    """Reopen the older LifeCam gently after the dark probe released it."""
+    last_error = None
+    for attempt in range(2):
+        try:
+            # Camera controls were already applied during the dark probe and
+            # persist in hardware. Reapplying them immediately can stall UVC.
+            return capture_frames(apply_settings=False)
+        except RuntimeError as exc:
+            last_error = exc
+            if "Kamerabilder empfangen" not in str(exc) or attempt == 1:
+                raise
+            print(
+                f"LifeCam lieferte nach Lichtstart keine Frames; neuer Versuch in "
+                f"{CAMERA_REOPEN_RETRY_SECONDS:.0f}s",
+                flush=True,
+            )
+            time.sleep(CAMERA_REOPEN_RETRY_SECONDS)
+    raise last_error
 
 
 def segment_scores(frame: np.ndarray) -> list[dict[str, float]]:
@@ -738,6 +763,56 @@ def ha_set_state(entity_id: str, state: str, attributes: dict) -> None:
             raise RuntimeError(f"Home Assistant antwortet mit HTTP {response.status}")
 
 
+def ha_get_state(entity_id: str) -> str:
+    """Read an entity state through the Home Assistant REST API."""
+    if not HA_URL or not HA_TOKEN:
+        raise RuntimeError("Home-Assistant-Zugang ist nicht konfiguriert")
+    request = Request(
+        f"{HA_URL}/api/states/{entity_id}",
+        headers={"Authorization": f"Bearer {HA_TOKEN}"},
+    )
+    with urlopen(request, timeout=10) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    return str(payload.get("state", "unknown"))
+
+
+def ha_call_service(domain: str, service: str, data: dict) -> None:
+    """Call a Home Assistant service and require a successful response."""
+    if not HA_URL or not HA_TOKEN:
+        raise RuntimeError("Home-Assistant-Zugang ist nicht konfiguriert")
+    request = Request(
+        f"{HA_URL}/api/services/{domain}/{service}",
+        data=json.dumps(data).encode("utf-8"),
+        method="POST",
+        headers={"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"},
+    )
+    with urlopen(request, timeout=10) as response:
+        if response.status not in (200, 201):
+            raise RuntimeError(f"Home Assistant antwortet mit HTTP {response.status}")
+
+
+def enable_water_light_for_capture() -> bool:
+    """Ensure the meter light is on and report whether WaterCAM switched it on."""
+    previous_state = ha_get_state(WATER_LIGHT_ENTITY)
+    if previous_state == "on":
+        print("Wasserzähler-Licht war bereits eingeschaltet", flush=True)
+        return False
+    if previous_state != "off":
+        raise RuntimeError(
+            f"Wasserzähler-Licht hat unbekannten Zustand: {previous_state}"
+        )
+    ha_call_service("light", "turn_on", {"entity_id": WATER_LIGHT_ENTITY})
+    print("Wasserzähler-Licht für OCR eingeschaltet", flush=True)
+    time.sleep(WATER_LIGHT_WARMUP_SECONDS)
+    return True
+
+
+def disable_water_light_after_capture() -> None:
+    """Turn off a meter light previously enabled by WaterCAM."""
+    ha_call_service("light", "turn_off", {"entity_id": WATER_LIGHT_ENTITY})
+    print("Wasserzähler-Licht nach OCR ausgeschaltet", flush=True)
+
+
 def publish_success(value: float, raw: str, confidence: float, timestamp: str) -> None:
     attributes = {
         "friendly_name": "Wasserzähler Zählerstand",
@@ -825,8 +900,14 @@ def measure_once() -> str:
     current_timestamp = datetime.fromisoformat(timestamp)
     previous, previous_timestamp = load_previous_reading()
     alignment = None
+    light_activated = False
     try:
-        frames, alignment = capture_frames()
+        try:
+            frames, alignment = capture_frames()
+        except FrameTooDarkError as dark_error:
+            print(f"{dark_error}; starte beleuchteten Zweitversuch", flush=True)
+            light_activated = enable_water_light_for_capture()
+            frames, alignment = capture_frames_after_lighting()
         readings = []
         score_sets = []
         for frame in frames:
@@ -926,6 +1007,15 @@ def measure_once() -> str:
                 flush=True,
             )
         return "dark" if is_dark else "error"
+    finally:
+        if light_activated:
+            try:
+                disable_water_light_after_capture()
+            except Exception as light_error:
+                print(
+                    f"Wasserzähler-Licht konnte nicht ausgeschaltet werden: {light_error}",
+                    flush=True,
+                )
 
 
 class ApiHandler(BaseHTTPRequestHandler):
